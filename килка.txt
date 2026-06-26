@@ -1,0 +1,1453 @@
+package ru.levin.modules.combat;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
+import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.mob.MobEntity;
+import net.minecraft.entity.mob.Monster;
+import net.minecraft.entity.passive.AnimalEntity;
+import net.minecraft.entity.passive.VillagerEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
+import net.minecraft.network.packet.c2s.play.CloseHandledScreenC2SPacket;
+import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec2f;
+import net.minecraft.util.math.Vec3d;
+import ru.levin.events.Event;
+import ru.levin.events.impl.EventUpdate;
+import ru.levin.events.impl.input.EventKeyBoard;
+import ru.levin.events.impl.move.EventMotion;
+import ru.levin.events.impl.player.EventSprint;
+import ru.levin.manager.Manager;
+import ru.levin.mixin.iface.ClientPlayerEntityAccessor;
+import ru.levin.modules.Function;
+import ru.levin.modules.FunctionAnnotation;
+import ru.levin.modules.Type;
+import ru.levin.modules.movement.ElytraTarget;
+import ru.levin.modules.render.littlePet.GhostWolfEntity;
+import ru.levin.modules.setting.*;
+import ru.levin.util.math.RayTraceUtil;
+import ru.levin.util.move.MoveUtil;
+import ru.levin.util.player.AuraUtil;
+import ru.levin.util.player.InventoryUtil;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+import static net.minecraft.util.Hand.MAIN_HAND;
+
+@SuppressWarnings("All")
+@FunctionAnnotation(name = "AttackAura", keywords = {"Пиздить", "Хуячить", "KillAura"}, desc = "Ебашит бошки всем вокруг", type = Type.Combat)
+public class AttackAura extends Function {
+
+    // -------------------- Режимы и настройки --------------------
+    private final ModeSetting mode = new ModeSetting("Мод",
+            "ReallyWorld",
+            "ReallyWorld", "HollyWorld", "FunTime", "SpookyTime", "Snap", "KoopinAc", "LonyGrief", "1.8.8",
+            "Legit", "Silent", "MultiAura", "Switch", "Velocity", "NeuroUltra", "Recorded"
+    );
+
+    private final MultiSetting targets = new MultiSetting(
+            "Цели",
+            Arrays.asList("Игроки", "Голые", "Мобы", "Монстры"),
+            new String[]{"Игроки", "Голые", "Друзья", "Мобы", "Монстры", "Жители"}
+    );
+
+    private final ModeSetting sort = new ModeSetting("Сортировать",
+            "По дистанции",
+            "По здоровью", "По дистанции", "По броне", "По углу", "По угрозе"
+    );
+
+    private final MultiSetting setting = new MultiSetting(
+            "Настройки",
+            Arrays.asList("Только критами", "Ломать щит", "Отжим щита"),
+            new String[]{"Только критами", "Ломать щит", "Отжим щита"}
+    );
+
+    private final SliderSetting distance = new SliderSetting("Радиус атаки", 3.0f, 1.8f, 6f, 0.1f);
+    private final SliderSetting rotateDistance = new SliderSetting("Радиус обнаружения", 5f, 0.0f, 10f, 0.1f);
+    private final SliderSetting elytraDistance = new SliderSetting("Радиус на элитрах", 40f, 0f, 80f, 1f);
+    private final SliderSetting snapSpeed = new SliderSetting("Скорость снапов", 150, 50, 300, 50f, () -> mode.is("Snap"));
+    private final SliderSetting attackDelay = new SliderSetting("Задержка атаки (мс)", 250, 100, 500, 10);
+    private final SliderSetting maxTargets = new SliderSetting("Макс. целей (MultiAura)", 2, 1, 5, 1, () -> mode.is("MultiAura"));
+    private final SliderSetting predictTicks = new SliderSetting("Предсказание (тики)", 3, 0, 10, 1);
+
+    // Настройки нейро-режима ULTRA
+    private final SliderSetting neuroMemory = new SliderSetting("Глубина памяти", 20, 5, 50, 1, () -> mode.is("NeuroUltra"));
+    private final SliderSetting neuroLearningRate = new SliderSetting("Скорость обучения", 0.1f, 0.01f, 0.5f, 0.01f, () -> mode.is("NeuroUltra"));
+    private final SliderSetting neuroEnsembleWeight = new SliderSetting("Вес ансамбля", 0.7f, 0.3f, 1.0f, 0.05f, () -> mode.is("NeuroUltra"));
+    private final SliderSetting neuroConfidenceThreshold = new SliderSetting("Порог уверенности", 0.6f, 0.2f, 0.9f, 0.05f, () -> mode.is("NeuroUltra"));
+    private final SliderSetting neuroJitterAmount = new SliderSetting("Случайность", 0.05f, 0.0f, 0.3f, 0.01f, () -> mode.is("NeuroUltra"));
+    private final BooleanSetting neuroSaveProfile = new BooleanSetting("Сохранять профили", true, () -> mode.is("NeuroUltra"));
+
+    // Настройки записи/воспроизведения
+    private final ModeSetting selectedRecording = new ModeSetting(() -> mode.is("Recorded"), "Выбор ротации", "Выберите ротацию");
+    private final TextSetting recordingName = new TextSetting("Имя ротации", "my_rotation");
+    private final BooleanSetting startRecording = new BooleanSetting("Начать запись", false);
+    private final BooleanSetting stopRecording = new BooleanSetting("Остановить запись", false);
+    private final BooleanSetting deleteRecording = new BooleanSetting("Удалить ротацию", false);
+    private final BooleanSetting autoUpdateList = new BooleanSetting("Автообновление списка", true);
+
+    private final BindBooleanSetting onlySpaceCritical = new BindBooleanSetting("Только с пробелом", false, () -> setting.get("Только критами"));
+    private final BooleanSetting noAttackIfEat = new BooleanSetting("Не бить если ешь", false);
+    private final BooleanSetting raycast = new BooleanSetting("Проверять наведение", false);
+    private final BooleanSetting randomizeRotations = new BooleanSetting("Рандомизировать повороты", false, () -> mode.is("Legit"));
+    private final BooleanSetting wallRange = new BooleanSetting("Атака сквозь стены", false);
+
+    public final BooleanSetting correction = new BooleanSetting("Коррекция", true);
+    public final ModeSetting correctionType = new ModeSetting(() -> correction.get(), "Тип коррекции", "Free", "Free", "Focus");
+    private final ModeSetting sprintReset = new ModeSetting("Тип спринта", "Rage", "Rage", "Legit", "None");
+
+    // -------------------- Поля состояния --------------------
+    public LivingEntity target = null;
+    private final List<LivingEntity> multiTargets = new ArrayList<>();
+    private long lastAttackMs = 0L;
+    private long cpsLimit = 0L;
+
+    private List<LivingEntity> cachedEntities = new ArrayList<>();
+    private int cacheTicker = 0;
+    private static final int CACHE_REFRESH_INTERVAL = 3;
+
+    private final Random random = new Random();
+    private float randomYawOffset = 0;
+    private float randomPitchOffset = 0;
+    private int randomUpdateTicks = 0;
+
+    // Для SpookyTime
+    private float bodyYaw, bodyPitch, prevBodyYaw, prevBodyPitch;
+    private float headYaw, headPitch, prevHeadYaw, prevHeadPitch;
+    private final int updateInterval = 2;
+    private final float maxYawShake = 0.3f;
+    private final float maxPitchShake = 0.25f;
+
+    // Для FunTime
+    private boolean swingSideRight = false;
+    private float jitterYaw = 0f, jitterYawTarget = 0f, jitterYawSpeed = 0f;
+    private float microJitter = 0f;
+    private float swayPhase = 0f;
+    private float swaySpeed = 0.04f;
+    private float swayAmplitude = 2.5f;
+    private long lastSwitch = 0L;
+    private long lastBreathChange = 0L;
+
+    // Для Switch
+    private long lastTargetSwitch = 0L;
+    private List<LivingEntity> switchQueue = new ArrayList<>();
+
+    // Для предсказания
+    private Vec3d lastTargetPos = null;
+    private Vec3d lastTargetVelocity = Vec3d.ZERO;
+    private long shakeStartTime = 0L;
+
+    // Нейро-движок ULTRA
+    private final NeuroEngineUltra neuroEngine = new NeuroEngineUltra();
+
+    // Нейро-запись и воспроизведение
+    private final NeuroRecorder recorder = new NeuroRecorder();
+
+    public AttackAura() {
+        addSettings(
+                mode, targets, sort, setting,
+                distance, rotateDistance, elytraDistance, snapSpeed,
+                attackDelay, maxTargets, predictTicks,
+                neuroMemory, neuroLearningRate, neuroEnsembleWeight, neuroConfidenceThreshold, neuroJitterAmount, neuroSaveProfile,
+                selectedRecording, recordingName, startRecording, stopRecording, deleteRecording, autoUpdateList,
+                correction, correctionType, sprintReset,
+                onlySpaceCritical, noAttackIfEat, raycast, randomizeRotations, wallRange
+        );
+        updateRecordingList();
+    }
+
+    @Override
+    public void onEvent(Event event) {
+        ClientPlayerEntity player = mc.player;
+        if (player == null || player.isDead()) {
+            reset();
+            return;
+        }
+
+        if (event instanceof EventKeyBoard e && correction.get() && correctionType.is("Free")) {
+            MoveUtil.fixMovement(e, Manager.FUNCTION_MANAGER.autoPotion.isActivePotion ?
+                    Manager.ROTATION.getPitch() : Manager.ROTATION.getYaw());
+        }
+
+        if (event instanceof EventSprint sprint && sprintReset.is("Legit")) {
+            // сброс спринта в attackTarget
+        }
+
+        if (event instanceof EventUpdate) {
+            updateTargetCache();
+
+            if (mode.is("MultiAura")) {
+                updateMultiTargets();
+            } else {
+                if (target == null || !isValidTarget(target)) {
+                    target = findBestTarget();
+                }
+            }
+
+            if ((mode.is("MultiAura") && multiTargets.isEmpty()) || (!mode.is("MultiAura") && target == null)) {
+                Manager.ROTATION.set(player.getYaw(), player.getPitch());
+                cpsLimit = System.currentTimeMillis();
+                return;
+            }
+
+            handleAttackAndRotation();
+        }
+
+        if (event instanceof EventMotion motion) {
+            motion.setYaw(Manager.ROTATION.getYaw());
+            motion.setPitch(Manager.ROTATION.getPitch());
+        }
+
+        // Обработка кнопок записи (с защитой от повторных вызовов)
+        if (startRecording.get()) {
+            startRecording.setValue(false);
+            startRecordingAction();
+        }
+        if (stopRecording.get()) {
+            stopRecording.setValue(false);
+            stopRecordingAction();
+        }
+        if (deleteRecording.get()) {
+            deleteRecording.setValue(false);
+            deleteRecordingAction();
+        }
+    }
+
+    @Override
+    protected void onEnable() {
+        super.onEnable();
+        reset();
+        neuroEngine.reset();
+        updateRecordingList();
+
+        if (mode.is("Recorded") && !recorder.isPlaying()) {
+            if (!selectedRecording.get().equals("Выберите ротацию") && !selectedRecording.get().isEmpty()) {
+                recorder.startPlayback(selectedRecording.get());
+            } else if (mc.player != null) {
+                mc.player.sendMessage(Text.literal("§c[AttackAura] Выберите ротацию в настройках для воспроизведения"), false);
+            }
+        }
+    }
+
+    @Override
+    protected void onDisable() {
+        if (recorder.isRecording()) recorder.stopRecording();
+        if (recorder.isPlaying()) recorder.stopPlayback();
+        if (target != null && isValidTarget(target)) {
+            String modeName = mode.get();
+            if (modeName.equals("FunTime") || modeName.equals("HollyWorld") || modeName.equals("ReallyWorld")) {
+                Manager.ROTATION.smoothReturn(350);
+            } else {
+                Manager.ROTATION.set(mc.player.getYaw(), mc.player.getPitch());
+            }
+        }
+        reset();
+        neuroEngine.reset();
+        super.onDisable();
+    }
+
+    private void reset() {
+        target = null;
+        multiTargets.clear();
+        cachedEntities.clear();
+        cacheTicker = 0;
+        cpsLimit = 0L;
+        lastAttackMs = 0L;
+        lastTargetPos = null;
+        lastTargetVelocity = Vec3d.ZERO;
+    }
+
+    // -------------------- Настройки записи/воспроизведения --------------------
+    private void updateRecordingList() {
+        List<String> list = recorder.listRecordings();
+        if (list.isEmpty()) {
+            selectedRecording.setValues(new String[]{"Выберите ротацию"});
+            selectedRecording.set("Выберите ротацию");
+        } else {
+            String[] arr = list.toArray(new String[0]);
+            selectedRecording.setValues(arr);
+            if (!selectedRecording.get().equals("Выберите ротацию") && !list.contains(selectedRecording.get())) {
+                selectedRecording.set(arr[0]);
+            } else if (selectedRecording.get().equals("Выберите ротацию")) {
+                selectedRecording.set(arr[0]);
+            }
+        }
+    }
+
+    private void startRecordingAction() {
+        if (recorder.isRecording()) {
+            // уже запись, не начинаем новую
+            return;
+        }
+        String name = recordingName.get();
+        if (name == null || name.isEmpty()) {
+            mc.player.sendMessage(Text.literal("§c[AttackAura] Введите имя ротации"), false);
+            return;
+        }
+        recorder.startRecording(name);
+        mc.player.sendMessage(Text.literal("§a[AttackAura] Начата запись: " + name), false);
+    }
+
+    private void stopRecordingAction() {
+        if (!recorder.isRecording()) {
+            return;
+        }
+        String lastRecording = recorder.getLastRecordingName();
+        recorder.stopRecording();
+        if (lastRecording != null) {
+            mc.player.sendMessage(Text.literal("§a[AttackAura] Запись сохранена: " + lastRecording), false);
+            updateRecordingList();
+        } else {
+            mc.player.sendMessage(Text.literal("§c[AttackAura] Ошибка: имя ротации не определено"), false);
+        }
+    }
+
+    private void deleteRecordingAction() {
+        String name = selectedRecording.get();
+        if (name.equals("Выберите ротацию") || name.isEmpty()) {
+            mc.player.sendMessage(Text.literal("§c[AttackAura] Сначала выберите ротацию"), false);
+            return;
+        }
+        recorder.deleteRecording(name);
+        updateRecordingList();
+        mc.player.sendMessage(Text.literal("§a[AttackAura] Ротация удалена: " + name), false);
+    }
+
+    // -------------------- Поиск и валидация целей --------------------
+    private void updateTargetCache() {
+        if (cacheTicker++ % CACHE_REFRESH_INTERVAL != 0) return;
+
+        List<LivingEntity> newList = new ArrayList<>();
+        for (Entity e : Manager.SYNC_MANAGER.getEntities()) {
+            if (e instanceof LivingEntity le && isValidTarget(le)) {
+                newList.add(le);
+            }
+        }
+        cachedEntities = newList;
+    }
+
+    private boolean isValidTarget(LivingEntity entity) {
+        if (entity == null || entity.isDead() || !entity.isAlive() || entity == mc.player) return false;
+
+        double dist = AuraUtil.getDistance(entity);
+        double attackRange = distance.get().doubleValue();
+        double detectRange = mc.player.isGliding() ? elytraDistance.get().doubleValue() : rotateDistance.get().doubleValue();
+
+        if (dist > attackRange && (detectRange <= 0 || dist > detectRange)) return false;
+        if (Manager.FUNCTION_MANAGER.antiBot.check(entity)) return false;
+
+        if (entity instanceof PlayerEntity) {
+            if (!targets.get("Игроки")) return false;
+            if (!targets.get("Друзья") && Manager.FRIEND_MANAGER.isFriend(entity.getName().getString())) return false;
+        } else if (entity instanceof VillagerEntity && !targets.get("Жители")) return false;
+        else if (entity instanceof MobEntity || entity instanceof AnimalEntity) {
+            if (!targets.get("Мобы")) return false;
+        } else if (entity instanceof Monster && !targets.get("Монстры")) return false;
+
+        if (entity instanceof ArmorStandEntity) return false;
+        if (Manager.FUNCTION_MANAGER.littleSnickers.state && (entity instanceof GhostWolfEntity)) return false;
+
+        if (entity instanceof PlayerEntity p && (p.isInvisible() || p.isCreative())) return false;
+
+        return true;
+    }
+
+    private LivingEntity findBestTarget() {
+        if (cachedEntities.isEmpty()) return null;
+
+        Comparator<LivingEntity> comparator;
+        switch (sort.get()) {
+            case "По здоровью":
+                comparator = Comparator.comparing(LivingEntity::getHealth);
+                break;
+            case "По дистанции":
+                comparator = Comparator.comparingDouble(mc.player::distanceTo);
+                break;
+            case "По броне":
+                comparator = Comparator.comparingDouble(AuraUtil::getArmor);
+                break;
+            case "По углу":
+                comparator = Comparator.comparingDouble(this::getAngleToEntity);
+                break;
+            case "По угрозе":
+                comparator = Comparator.comparingDouble(this::getThreatLevel).reversed();
+                break;
+            default:
+                comparator = Comparator.comparingDouble(mc.player::distanceTo);
+        }
+
+        return cachedEntities.stream().min(comparator).orElse(null);
+    }
+
+    private void updateMultiTargets() {
+        multiTargets.clear();
+        int max = maxTargets.get().intValue();
+        if (max <= 0) return;
+
+        List<LivingEntity> sorted = new ArrayList<>(cachedEntities);
+        sorted.sort(Comparator.comparingDouble(mc.player::distanceTo));
+        for (int i = 0; i < Math.min(max, sorted.size()); i++) {
+            multiTargets.add(sorted.get(i));
+        }
+    }
+
+    // -------------------- Обработка атаки и ротации --------------------
+    private void handleAttackAndRotation() {
+        boolean canAttackNow = canAttack();
+        boolean noPotion = !Manager.FUNCTION_MANAGER.autoPotion.isActivePotion;
+
+        // Режим Recorded (воспроизведение записи)
+        if (mode.is("Recorded")) {
+            if (recorder.isPlaying()) {
+                RotationFrame frame = recorder.getCurrentPlaybackFrame();
+                if (frame != null) {
+                    Manager.ROTATION.setSmooth(frame.yaw, frame.pitch, 0.9f, 120f, 20f, true);
+                    if (frame.attack && canAttackNow && checkRaycast(target) && noPotion && target != null) {
+                        attackTarget(target);
+                    }
+                } else {
+                    recorder.stopPlayback();
+                }
+            } else if (autoUpdateList.get() && !selectedRecording.get().equals("Выберите ротацию")) {
+                recorder.startPlayback(selectedRecording.get());
+            }
+        }
+
+        // MultiAura
+        if (mode.is("MultiAura")) {
+            for (LivingEntity e : multiTargets) {
+                if (shouldAttack(e) && canAttackNow && checkRaycast(e) && noPotion) attackTarget(e);
+            }
+            if (!multiTargets.isEmpty()) setRotation(multiTargets.get(0), true);
+            return;
+        }
+
+        if (target == null) return;
+
+        // Элитры
+        if (handleElytraRotation(target)) {
+            if (shouldAttack(target) && canAttackNow && checkRaycast(target) && noPotion) attackTarget(target);
+            return;
+        }
+
+        String modeName = mode.get();
+        switch (modeName) {
+            case "NeuroUltra":
+                handleNeuroUltra(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "KoopinAc":
+            case "1.8.8":
+                koopinVector(target, true);
+                if (shouldAttack(target) && canAttackNow && checkRaycast(target) && noPotion) attackTarget(target);
+                break;
+            case "SpookyTime":
+                handleSpookyTime(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "LonyGrief":
+                handleLonyGrief(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "FunTime":
+                handleFunTime(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "HollyWorld":
+                handleHollyWorld(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "Snap":
+                handleSnap(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "Switch":
+                handleSwitchMode(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "Legit":
+                handleLegit(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "Silent":
+                handleSilent(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            case "Velocity":
+                handleVelocity(target, canAttackNow && checkRaycast(target) && noPotion);
+                break;
+            default:
+                if (shouldAttack(target) && canAttackNow && checkRaycast(target) && noPotion) attackTarget(target);
+                setRotation(target, true);
+                break;
+        }
+
+        // ЗАПИСЬ КАДРОВ (работает в любом режиме, если запись активна)
+        if (recorder.isRecording()) {
+            float yaw = Manager.ROTATION.getYaw();
+            float pitch = Manager.ROTATION.getPitch();
+            boolean attacking = canAttackNow && target != null && checkRaycast(target) && noPotion;
+            recorder.recordFrame(yaw, pitch, attacking);
+        }
+    }
+
+    // -------------------- Нейро-режим ULTRA --------------------
+    private void handleNeuroUltra(LivingEntity t, boolean attack) {
+        neuroEngine.update(t);
+        Vec3d predictedPoint = neuroEngine.getPredictedPoint(t, attack);
+        Vec2f rot = getRotationTo(predictedPoint);
+        float smooth = 0.85f;
+        if (neuroJitterAmount.get().floatValue() > 0) {
+            rot = new Vec2f(
+                    rot.x + (random.nextFloat() - 0.5f) * neuroJitterAmount.get().floatValue() * 5,
+                    rot.y + (random.nextFloat() - 0.5f) * neuroJitterAmount.get().floatValue() * 5
+            );
+        }
+        Manager.ROTATION.setSmooth(rot.y, rot.x, smooth, 120f, 20f, true);
+        if (attack) {
+            attackTarget(t);
+            neuroEngine.onAttackSuccess(t);
+        } else {
+            neuroEngine.onAttackMiss(t);
+        }
+    }
+
+    // -------------------- Режимы (SpookyTime, LonyGrief, FunTime, HollyWorld, Snap, Switch, Legit, Silent, Velocity, koopinVector) --------------------
+    private void handleSpookyTime(LivingEntity t, boolean attack) {
+        if (mc.player == null) return;
+
+        if (target == null) {
+            randomYawOffset = 0;
+            randomPitchOffset = 0;
+            float centerYaw = mc.player.getYaw();
+            float centerPitch = mc.player.getPitch();
+
+            prevBodyYaw = bodyYaw;
+            prevBodyPitch = bodyPitch;
+            float yawDiff = MathHelper.wrapDegrees(centerYaw - bodyYaw);
+            float pitchDiff = centerPitch - bodyPitch;
+            bodyYaw += MathHelper.clamp(yawDiff, -45, 45);
+            bodyPitch = MathHelper.clamp(bodyPitch + pitchDiff, -90f, 90f);
+
+            prevHeadYaw = headYaw;
+            prevHeadPitch = headPitch;
+            float yawDiffH = MathHelper.wrapDegrees(centerYaw - headYaw);
+            float pitchDiffH = centerPitch - headPitch;
+            headYaw += MathHelper.clamp(yawDiffH, -50, 50);
+            headPitch = MathHelper.clamp(headPitch + pitchDiffH, -90f, 90f);
+            return;
+        }
+
+        randomUpdateTicks++;
+        if (randomUpdateTicks >= updateInterval) {
+            randomUpdateTicks = 0;
+            randomYawOffset = (random.nextFloat() * 2 - 1) * maxYawShake;
+            randomPitchOffset = (random.nextFloat() * 2 - 1) * maxPitchShake;
+        }
+
+        Vec3d targetPos = getRandomBodyPoint(t);
+        Vec2f rot = getRotationTo(targetPos);
+
+        prevBodyYaw = bodyYaw;
+        prevBodyPitch = bodyPitch;
+        float yawDiff = MathHelper.wrapDegrees(rot.y - bodyYaw);
+        float pitchDiff = rot.x - bodyPitch;
+        bodyYaw += MathHelper.clamp(yawDiff, -45, 45);
+        bodyPitch = MathHelper.clamp(bodyPitch + pitchDiff, -45, 45);
+
+        prevHeadYaw = headYaw;
+        prevHeadPitch = headPitch;
+        float yawDiffH = MathHelper.wrapDegrees(rot.y - headYaw);
+        float pitchDiffH = rot.x - headPitch;
+        headYaw += MathHelper.clamp(yawDiffH, -50, 50);
+        headPitch = MathHelper.clamp(headPitch + pitchDiffH, -50, 50);
+
+        Vec2f finalRot = new Vec2f(rot.x + randomPitchOffset, rot.y + randomYawOffset);
+        Manager.ROTATION.setSmooth(finalRot.y, finalRot.x, 0.8f, 60, 90, true);
+
+        if (attack) attackTarget(t);
+    }
+
+    private void handleLonyGrief(LivingEntity t, boolean attack) {
+        Vec3d tp = predictPos(t);
+        double yawToTarget = Math.toDegrees(Math.atan2(tp.z - mc.player.getZ(), tp.x - mc.player.getX())) - 90.0;
+        double yawDiff = Math.abs(MathHelper.wrapDegrees((float) yawToTarget - Manager.ROTATION.getYaw()));
+        if (yawDiff <= 180 && attack) attackTarget(t);
+        Manager.ROTATION.set(mc.player.getYaw(), mc.player.getPitch());
+    }
+
+    private void handleFunTime(LivingEntity t, boolean attack) {
+        if (attack) {
+            attackTarget(t);
+            lastAttackMs = System.currentTimeMillis();
+        }
+
+        if (System.currentTimeMillis() - lastAttackMs < 450) {
+            Vec3d eye = mc.player.getEyePos();
+            Vec3d base = t.getPos();
+            float[] points = new float[]{0.82f, 0.67f, 0.43f, 0.27f};
+            float mul = points[(int) (System.currentTimeMillis() / 180 % points.length)];
+            Vec3d targetPos = new Vec3d(base.x, base.y + t.getHeight() * mul, base.z);
+
+            double halfWidth = t.getWidth() / 2.0;
+            double sideOffset = swingSideRight ? halfWidth * 1.2f : -halfWidth;
+            double yawToEntity = Math.atan2(t.getZ() - mc.player.getZ(), t.getX() - mc.player.getX());
+            double offsetX = Math.cos(yawToEntity + Math.PI / 2) * sideOffset;
+            double offsetZ = Math.sin(yawToEntity + Math.PI / 2) * sideOffset;
+            targetPos = targetPos.add(offsetX, 0, offsetZ);
+
+            Vec2f rot = getRotationTo(targetPos);
+            long now = System.currentTimeMillis();
+
+            if (now - lastSwitch > 200 + random.nextInt(250)) {
+                lastSwitch = now;
+                swingSideRight = !swingSideRight;
+                float distanceFactor = (float) MathHelper.clamp(mc.player.distanceTo(t) / 6.0f, 0.4f, 1.0f);
+                float maxDeviation = 4.0f * distanceFactor;
+                jitterYawTarget = (swingSideRight ? maxDeviation : -maxDeviation) + (float) (random.nextGaussian() * 0.6f);
+            }
+
+            float diff = jitterYawTarget - jitterYaw;
+            jitterYawSpeed += diff * 0.05f;
+            jitterYawSpeed *= 0.88f;
+            jitterYaw += jitterYawSpeed;
+            jitterYaw *= 0.985f;
+
+            if (now - lastBreathChange > 2000 + random.nextInt(1500)) {
+                lastBreathChange = now;
+                swaySpeed = 0.035f + random.nextFloat() * 0.02f;
+                swayAmplitude = 2.0f + random.nextFloat() * 1.2f;
+            }
+
+            swayPhase += swaySpeed;
+            float sway = (float) Math.sin(swayPhase) * swayAmplitude;
+            float totalYawOffset = (float) MathHelper.clamp(jitterYaw + sway, -halfWidth * 8.5f, halfWidth * 8.5f);
+            microJitter += (random.nextFloat() - 0.5f) * 0.25f;
+            microJitter *= 0.85f;
+
+            float finalYaw = rot.y + totalYawOffset + microJitter;
+            float finalPitch = rot.x + (float) Math.sin(swayPhase * 0.8f) * 0.5f;
+            Manager.ROTATION.setSmooth(finalYaw, finalPitch, 1.1f, 180f, 15f, true);
+        } else {
+            long currentTime = System.currentTimeMillis();
+            if (shakeStartTime == 0L) shakeStartTime = currentTime;
+            float elapsedSec = (currentTime - shakeStartTime) / 1000f;
+            double angle = 2 * Math.PI * 2.4 * elapsedSec;
+            float yawOffset = (float) Math.sin(angle) * 24f;
+            double angle2 = 2 * Math.PI * 0.08f * elapsedSec;
+            double[] options = {5.0, 5.5, 5.8, 6.0};
+            double randAmplitude = options[(int) (Math.random() * options.length)];
+            float yawOffset2 = (float) (Math.sin(angle2) * randAmplitude);
+            float finalYaw = mc.player.getYaw() + yawOffset + yawOffset2;
+            float finalPitch = 0.0f + yawOffset2;
+            Manager.ROTATION.setSmooth(finalYaw, finalPitch, 1.0f, 20f, 10f, true);
+        }
+    }
+
+    private void handleHollyWorld(LivingEntity t, boolean attack) {
+        Vec3d eye = mc.player.getEyePos();
+        Vec3d base = t.getPos();
+        float[] points = new float[]{0.85f, 0.65f, 0.35f, 0.25f};
+        float mul = points[(int) (System.nanoTime() % points.length)];
+        Vec3d aim = new Vec3d(base.x, base.y + t.getHeight() * mul, base.z);
+        Vec2f rot = getRotationTo(aim);
+        if (attack) {
+            Manager.ROTATION.set(rot.y, MathHelper.clamp(rot.x, -89.9f, 89.9f));
+            attackTarget(t);
+        } else {
+            Manager.ROTATION.setSmooth(rot.y, rot.x, 0.25f, 45f, 12f, true);
+        }
+    }
+
+    private void handleSnap(LivingEntity t, boolean attack) {
+        if (attack) {
+            attackTarget(t);
+            lastAttackMs = System.currentTimeMillis();
+        }
+        if (System.currentTimeMillis() - lastAttackMs < snapSpeed.get().floatValue()) {
+            setRotation(t, true);
+        } else {
+            Manager.ROTATION.set(mc.player.getYaw(), mc.player.getPitch());
+        }
+    }
+
+    private void handleSwitchMode(LivingEntity initial, boolean attack) {
+        if (attack) {
+            attackTarget(initial);
+            lastAttackMs = System.currentTimeMillis();
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - lastTargetSwitch > 200 + random.nextInt(200)) {
+            lastTargetSwitch = now;
+            if (switchQueue.isEmpty()) {
+                switchQueue = new ArrayList<>(cachedEntities);
+                switchQueue.removeIf(e -> !isValidTarget(e) || e == initial);
+            }
+            if (!switchQueue.isEmpty()) {
+                target = switchQueue.remove(random.nextInt(switchQueue.size()));
+            } else {
+                target = findBestTarget();
+            }
+        }
+
+        if (target != null) {
+            setRotation(target, true);
+        }
+    }
+
+    private void handleLegit(LivingEntity t, boolean attack) {
+        if (attack) {
+            attackTarget(t);
+        }
+        setRotationSmooth(t, 0.4f);
+    }
+
+    private void handleSilent(LivingEntity t, boolean attack) {
+        if (attack) {
+            mc.interactionManager.attackEntity(mc.player, t);
+            mc.player.swingHand(MAIN_HAND);
+            lastAttackMs = System.currentTimeMillis();
+        }
+        // Silent mode: no visible rotation
+    }
+
+    private void handleVelocity(LivingEntity t, boolean attack) {
+        Vec3d predicted = predictPos(t);
+        Vec2f rot = getRotationTo(predicted);
+        float finalYaw = rot.y + (float) (Math.sin(System.currentTimeMillis() / 50.0) * 2.0);
+        float finalPitch = rot.x + (float) (Math.cos(System.currentTimeMillis() / 70.0) * 1.0);
+        Manager.ROTATION.setSmooth(finalYaw, finalPitch, 1.5f, 200f, 20f, true);
+        if (attack) attackTarget(t);
+    }
+
+    // -------------------- Вспомогательные методы --------------------
+    private boolean checkRaycast(LivingEntity entity) {
+        if (!raycast.get()) return true;
+        if (wallRange.get()) return true;
+        float currYaw = Manager.ROTATION.getYaw();
+        float currPitch = Manager.ROTATION.getPitch();
+        return RayTraceUtil.getMouseOver(entity, currYaw, currPitch, distance.get().floatValue()) == entity;
+    }
+
+    private boolean handleElytraRotation(LivingEntity t) {
+        ElytraTarget ely = Manager.FUNCTION_MANAGER.elytraTarget;
+        if (ely.state && mc.player.isGliding()) {
+            if (ely.mode.is("Продвинутый")) ely.overtakingElytra(t, false);
+            else ely.targetDefault(t, false);
+            return true;
+        }
+        return false;
+    }
+
+    private void setRotation(LivingEntity entity, boolean applyGcd) {
+        Vec3d tp = predictPos(entity);
+        Vec2f rot = getRotationTo(tp);
+        Manager.ROTATION.setSmooth(rot.y, rot.x, 1.2f, 180f, 15f, applyGcd);
+    }
+
+    private void setRotationSmooth(LivingEntity entity, float speed) {
+        Vec3d tp = predictPos(entity);
+        Vec2f rot = getRotationTo(tp);
+        if (randomizeRotations.get()) {
+            rot = new Vec2f(rot.x + (random.nextFloat() - 0.5f) * 1.5f,
+                    rot.y + (random.nextFloat() - 0.5f) * 1.5f);
+        }
+        Manager.ROTATION.setSmooth(rot.y, rot.x, speed, 90f, 10f, true);
+    }
+
+    private Vec2f getRotationTo(Vec3d point) {
+        Vec3d eye = mc.player.getEyePos();
+        double dx = point.x - eye.x;
+        double dy = point.y - eye.y;
+        double dz = point.z - eye.z;
+        double hDist = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, hDist));
+        return new Vec2f(pitch, yaw);
+    }
+
+    private Vec3d predictPos(LivingEntity e) {
+        Vec3d currentPos = e.getPos();
+        Vec3d velocity = e.getVelocity();
+
+        var ts = Manager.FUNCTION_MANAGER.targetStrafe;
+        if (ts.state && ts.predictCheck.get()) {
+            float pr = ts.predict.get().floatValue();
+            if (pr > 0) {
+                return currentPos.add(velocity.multiply(pr));
+            }
+        }
+
+        int ticks = predictTicks.get().intValue();
+        if (ticks <= 0) return currentPos;
+
+        if (lastTargetPos != null) {
+            velocity = currentPos.subtract(lastTargetPos);
+            lastTargetVelocity = velocity;
+        }
+        lastTargetPos = currentPos;
+
+        Vec3d predicted = currentPos.add(velocity.multiply(ticks));
+        double maxPredict = e.getBoundingBox().getAverageSideLength() * ticks;
+        if (predicted.distanceTo(currentPos) > maxPredict) {
+            predicted = currentPos.add(velocity.normalize().multiply(maxPredict));
+        }
+        return predicted;
+    }
+
+    private Vec3d getRandomBodyPoint(LivingEntity entity) {
+        double x = entity.getBoundingBox().getCenter().x;
+        double y = entity.getY();
+        double z = entity.getBoundingBox().getCenter().z;
+
+        int randPoint = random.nextInt(4);
+        switch (randPoint) {
+            case 0 -> y += entity.getHeight() * 0.9;
+            case 1 -> y += entity.getHeight() * 0.75;
+            case 2 -> y += entity.getHeight() * 0.5;
+            case 3 -> y += entity.getHeight() * 0.25;
+        }
+
+        x += (random.nextDouble() * 0.4 - 0.2);
+        z += (random.nextDouble() * 0.4 - 0.2);
+
+        return new Vec3d(x, y, z);
+    }
+
+    private void koopinVector(LivingEntity entity, boolean attackContext) {
+        Vec3d head = entity.getEyePos().add(0, entity.getHeight(), 0);
+        Vec3d chest = entity.getEyePos().add(0, entity.getStandingEyeHeight() / 2.0f, 0);
+        Vec3d legs = entity.getEyePos().add(0, 0.05, 0);
+        Vec3d[] points = new Vec3d[]{head, chest, legs};
+
+        float bestPitchDelta = Float.MAX_VALUE;
+        Vec3d best = chest;
+        float currPitch = Manager.ROTATION.getPitch();
+        float currYaw = Manager.ROTATION.getYaw();
+
+        for (Vec3d p : points) {
+            Vec2f rot = getRotationTo(p);
+            float pitchDelta = Math.abs(rot.x - currPitch);
+            if (pitchDelta < bestPitchDelta) {
+                bestPitchDelta = pitchDelta;
+                best = p;
+            }
+        }
+
+        Vec2f rot = getRotationTo(best);
+        float yawDelta = MathHelper.wrapDegrees(rot.y - currYaw);
+        float pitchDelta = rot.x - currPitch;
+
+        float addYaw = Math.min(Math.max(Math.abs(yawDelta), 1), 80);
+        if (Math.abs(addYaw) <= 3.0f) addYaw = 3.1f;
+        float addPitch = Math.max(attackContext ? Math.abs(pitchDelta) : 1.0f, 2.0f);
+
+        float ny = currYaw + (yawDelta > 0 ? addYaw : -addYaw);
+        float np = MathHelper.clamp(currPitch + (pitchDelta > 0 ? addPitch : -addPitch), -90.0f, 90.0f);
+        Manager.ROTATION.set(ny, np);
+    }
+
+    private void attackTarget(LivingEntity e) {
+        if (e == null) return;
+
+        boolean sprintStop = false;
+        boolean canStartSprint = mc.player.input.movementForward > 0
+                && !mc.player.hasStatusEffect(StatusEffects.BLINDNESS)
+                && !mc.player.isGliding()
+                && !mc.player.isUsingItem()
+                && !mc.player.horizontalCollision
+                && mc.player.getHungerManager().getFoodLevel() > 6
+                && !mc.player.isSneaking();
+
+        if (setting.get("Отжим щита") && mc.player.isBlocking()) {
+            mc.interactionManager.stopUsingItem(mc.player);
+        }
+
+        if (sprintReset.is("Rage")) {
+            if (((ClientPlayerEntityAccessor) mc.player).getLastSprinting()) {
+                mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.STOP_SPRINTING));
+                mc.player.setSprinting(false);
+                sprintStop = true;
+            }
+        }
+
+        cpsLimit = System.currentTimeMillis() + attackDelay.get().longValue();
+        lastAttackMs = System.currentTimeMillis();
+
+        mc.interactionManager.attackEntity(mc.player, e);
+        mc.player.swingHand(MAIN_HAND);
+
+        if (setting.get("Ломать щит") && e instanceof PlayerEntity) {
+            shieldBreaker((PlayerEntity) e);
+        }
+
+        ElytraTarget elytraTarget = Manager.FUNCTION_MANAGER.elytraTarget;
+        if (elytraTarget.mode.is("Продвинутый")) {
+            elytraTarget.trueFireWork = true;
+            if (elytraTarget.prefer.get()) elytraTarget.nextPhase(e);
+        }
+
+        if (sprintReset.is("Rage") && sprintStop && canStartSprint) {
+            if (((ClientPlayerEntityAccessor) mc.player).getLastSprinting()) {
+                mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.START_SPRINTING));
+                mc.player.setSprinting(true);
+            }
+        }
+    }
+
+    private boolean shieldBreaker(PlayerEntity targetPlayer) {
+        int axeSlot = InventoryUtil.getAxe().slot();
+        if (axeSlot == -1) return false;
+        if (!targetPlayer.isUsingItem()) return false;
+        if (targetPlayer.getOffHandStack().getItem() != Items.SHIELD
+                && targetPlayer.getMainHandStack().getItem() != Items.SHIELD) return false;
+
+        if (axeSlot >= 9) {
+            mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, axeSlot,
+                    mc.player.getInventory().selectedSlot, SlotActionType.SWAP, mc.player);
+            mc.getNetworkHandler().sendPacket(new CloseHandledScreenC2SPacket(mc.player.currentScreenHandler.syncId));
+            mc.interactionManager.attackEntity(mc.player, targetPlayer);
+            mc.player.swingHand(Hand.MAIN_HAND);
+            mc.interactionManager.clickSlot(mc.player.currentScreenHandler.syncId, axeSlot,
+                    mc.player.getInventory().selectedSlot, SlotActionType.SWAP, mc.player);
+            mc.getNetworkHandler().sendPacket(new CloseHandledScreenC2SPacket(mc.player.currentScreenHandler.syncId));
+        } else {
+            mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(axeSlot));
+            mc.interactionManager.attackEntity(mc.player, targetPlayer);
+            mc.player.swingHand(Hand.MAIN_HAND);
+            mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(mc.player.getInventory().selectedSlot));
+        }
+        return true;
+    }
+
+    private boolean shouldAttack(LivingEntity e) {
+        if (e == null) return false;
+        if (cpsLimit > System.currentTimeMillis()) return false;
+        if (AuraUtil.getDistance(e) > distance.get().doubleValue()) return false;
+        return canAttack();
+    }
+
+    private boolean canAttack() {
+        if (noAttackIfEat.get() && mc.player.isUsingItem() && !mc.player.getActiveItem().isOf(Items.SHIELD)) return false;
+        if (System.currentTimeMillis() < cpsLimit) return false;
+
+        if (!(mc.player.getMainHandStack().isOf(Items.MACE))
+                && mc.player.getAttackCooldownProgress(mc.getRenderTickCounter().getTickDelta(true)) < 0.9F) return false;
+
+        boolean restrict = mc.player.hasStatusEffect(StatusEffects.BLINDNESS)
+                || mc.player.hasStatusEffect(StatusEffects.LEVITATION)
+                || mc.player.hasStatusEffect(StatusEffects.SLOW_FALLING)
+                || mc.player.isInLava()
+                || mc.player.inPowderSnow
+                || mc.player.isClimbing()
+                || mc.player.hasVehicle()
+                || mc.player.getAbilities().flying
+                || (mc.player.isInFluid() && !mc.options.jumpKey.isPressed())
+                || MoveUtil.isInWeb();
+
+        boolean needSpace = onlySpaceCritical.get()
+                && mc.player.isOnGround()
+                && !mc.options.jumpKey.isPressed();
+
+        if (setting.get("Только критами") && !restrict) {
+            return needSpace || (!mc.player.isOnGround() && mc.player.fallDistance > 0.0f);
+        }
+        return true;
+    }
+
+    private double getAngleToEntity(LivingEntity entity) {
+        Vec2f rot = getRotationTo(entity.getBoundingBox().getCenter());
+        float yawDiff = MathHelper.wrapDegrees(rot.y - Manager.ROTATION.getYaw());
+        float pitchDiff = rot.x - Manager.ROTATION.getPitch();
+        return Math.sqrt(yawDiff * yawDiff + pitchDiff * pitchDiff);
+    }
+
+    private double getThreatLevel(LivingEntity entity) {
+        double threat = 0.0;
+        if (entity instanceof PlayerEntity p) {
+            threat += p.getHealth() < 10 ? 5 : 0;
+            threat += (p.getArmor() / 20.0) * 10;
+            threat += p.getMainHandStack().getMaxDamage() / 100.0;
+            if (p.isBlocking()) threat += 3;
+        } else if (entity instanceof Monster) {
+            threat += 2;
+        }
+        return threat;
+    }
+
+    // -------------------- НЕЙРО-ДВИЖОК ULTRA (полная система предсказания) --------------------
+    private class NeuroEngineUltra {
+        // История позиций с временными метками
+        private final Deque<HistoryEntry> history = new ArrayDeque<>();
+        private Vec3d lastPos = null;
+        private long lastTime = 0;
+
+        // Модели предсказания
+        private final List<PredictionModel> models = new ArrayList<>();
+        private double[] modelWeights;
+
+        // Профиль противника
+        private PlayerProfile profile = null;
+
+        // Смещение (bias)
+        private Vec3d bias = Vec3d.ZERO;
+
+        // Статистика
+        private int hitCount = 0;
+        private int missCount = 0;
+
+        public NeuroEngineUltra() {
+            models.add(new ConstantVelocityModel());
+            models.add(new ConstantAccelerationModel());
+            models.add(new SmoothedDirectionModel());
+            models.add(new ClusterBasedModel());
+            models.add(new RecurrentModel());
+            modelWeights = new double[models.size()];
+            Arrays.fill(modelWeights, 1.0 / models.size());
+        }
+
+        public void update(LivingEntity target) {
+            long now = System.currentTimeMillis();
+            Vec3d pos = target.getPos();
+            if (lastPos != null && lastTime > 0) {
+                double dt = (now - lastTime) / 1000.0;
+                if (dt > 0.001) {
+                    history.add(new HistoryEntry(pos, now, dt));
+                    while (history.size() > neuroMemory.get().intValue()) {
+                        history.removeFirst();
+                    }
+                }
+            }
+            lastPos = pos;
+            lastTime = now;
+
+            if (neuroSaveProfile.get() && target instanceof PlayerEntity) {
+                updateProfile(target);
+            }
+        }
+
+        public Vec3d getPredictedPoint(LivingEntity target, boolean attackNow) {
+            if (history.isEmpty()) return target.getPos();
+
+            double px = 0, py = 0, pz = 0;
+            double totalWeight = 0;
+            for (int i = 0; i < models.size(); i++) {
+                Vec3d pred = models.get(i).predict(history, target);
+                px += pred.x * modelWeights[i];
+                py += pred.y * modelWeights[i];
+                pz += pred.z * modelWeights[i];
+                totalWeight += modelWeights[i];
+            }
+            if (totalWeight > 0) {
+                px /= totalWeight;
+                py /= totalWeight;
+                pz /= totalWeight;
+            }
+            Vec3d finalPred = new Vec3d(px, py, pz);
+
+            // Применяем смещение и профиль
+            finalPred = finalPred.add(bias);
+            if (profile != null) finalPred = profile.correctPrediction(finalPred);
+
+            Box box = target.getBoundingBox();
+            double x = MathHelper.clamp(finalPred.x, box.minX, box.maxX);
+            double y = MathHelper.clamp(finalPred.y, box.minY + 0.1, box.maxY - 0.1);
+            double z = MathHelper.clamp(finalPred.z, box.minZ, box.maxZ);
+            if (!target.isOnGround()) y += 0.2;
+            return new Vec3d(x, y, z);
+        }
+
+        public void onAttackSuccess(LivingEntity target) {
+            hitCount++;
+            updateWeights(true);
+            bias = bias.multiply(0.95);
+            if (neuroSaveProfile.get() && target instanceof PlayerEntity) saveProfile(target);
+        }
+
+        public void onAttackMiss(LivingEntity target) {
+            missCount++;
+            updateWeights(false);
+            Vec3d vel = target.getVelocity();
+            if (vel.lengthSquared() > 0.01) {
+                double adapt = neuroLearningRate.get().floatValue();
+                bias = bias.add(vel.multiply(adapt * 0.2));
+                double maxBias = 1.0;
+                if (bias.length() > maxBias) bias = bias.normalize().multiply(maxBias);
+            }
+            if (neuroSaveProfile.get() && target instanceof PlayerEntity) saveProfile(target);
+        }
+
+        private void updateWeights(boolean success) {
+            if (history.size() < 2) return;
+            HistoryEntry last = history.getLast();
+            Vec3d actual = last.pos;
+            double[] errors = new double[models.size()];
+            double minError = Double.MAX_VALUE;
+            for (int i = 0; i < models.size(); i++) {
+                Vec3d pred = models.get(i).predict(history, null);
+                double err = pred.distanceTo(actual);
+                errors[i] = err;
+                if (err < minError) minError = err;
+            }
+            double lr = neuroLearningRate.get().floatValue();
+            for (int i = 0; i < models.size(); i++) {
+                if (success && errors[i] == minError) {
+                    modelWeights[i] += lr;
+                } else if (!success) {
+                    modelWeights[i] -= lr * 0.5;
+                }
+                if (modelWeights[i] < 0) modelWeights[i] = 0;
+            }
+            double sum = Arrays.stream(modelWeights).sum();
+            if (sum > 0) {
+                for (int i = 0; i < modelWeights.length; i++) modelWeights[i] /= sum;
+            } else {
+                Arrays.fill(modelWeights, 1.0 / models.size());
+            }
+        }
+
+        private void updateProfile(LivingEntity target) {
+            String name = target.getName().getString();
+            profile = loadProfile(name);
+            if (profile == null) profile = new PlayerProfile(name);
+            profile.update(target, history);
+        }
+
+        private void saveProfile(LivingEntity target) {
+            if (profile != null) profile.save();
+        }
+
+        private PlayerProfile loadProfile(String name) {
+            Path path = Paths.get(System.getProperty("user.dir"), "run", "profiles", name + ".json");
+            if (!Files.exists(path)) return null;
+            try (Reader reader = new FileReader(path.toFile())) {
+                Gson gson = new Gson();
+                return gson.fromJson(reader, PlayerProfile.class);
+            } catch (IOException e) {
+                return null;
+            }
+        }
+
+        public void reset() {
+            history.clear();
+            lastPos = null;
+            bias = Vec3d.ZERO;
+            hitCount = missCount = 0;
+            Arrays.fill(modelWeights, 1.0 / models.size());
+            profile = null;
+        }
+    }
+
+    // -------------------- Вспомогательные классы для нейро-движка --------------------
+    private static class HistoryEntry {
+        final Vec3d pos;
+        final long time;
+        final double dt;
+        HistoryEntry(Vec3d pos, long time, double dt) {
+            this.pos = pos;
+            this.time = time;
+            this.dt = dt;
+        }
+    }
+
+    private interface PredictionModel {
+        Vec3d predict(Deque<HistoryEntry> history, LivingEntity target);
+    }
+
+    private static class ConstantVelocityModel implements PredictionModel {
+        @Override
+        public Vec3d predict(Deque<HistoryEntry> history, LivingEntity target) {
+            if (history.size() < 2) return target != null ? target.getPos() : Vec3d.ZERO;
+            HistoryEntry prev = history.getFirst();
+            HistoryEntry last = history.getLast();
+            double dt = (last.time - prev.time) / 1000.0;
+            if (dt <= 0) return last.pos;
+            Vec3d vel = last.pos.subtract(prev.pos).multiply(1.0 / dt);
+            return last.pos.add(vel.multiply(0.05));
+        }
+    }
+
+    private static class ConstantAccelerationModel implements PredictionModel {
+        @Override
+        public Vec3d predict(Deque<HistoryEntry> history, LivingEntity target) {
+            if (history.size() < 3) return target != null ? target.getPos() : Vec3d.ZERO;
+            List<HistoryEntry> list = new ArrayList<>(history);
+            int n = list.size();
+            HistoryEntry p0 = list.get(n-3);
+            HistoryEntry p1 = list.get(n-2);
+            HistoryEntry p2 = list.get(n-1);
+            double dt1 = p1.dt;
+            double dt2 = p2.dt;
+            if (dt1 <= 0 || dt2 <= 0) return p2.pos;
+            Vec3d v1 = p1.pos.subtract(p0.pos).multiply(1.0 / dt1);
+            Vec3d v2 = p2.pos.subtract(p1.pos).multiply(1.0 / dt2);
+            Vec3d a = v2.subtract(v1).multiply(1.0 / ((p2.time - p0.time)/1000.0));
+            return p2.pos.add(v2.multiply(0.05)).add(a.multiply(0.05*0.05*0.5));
+        }
+    }
+
+    private static class SmoothedDirectionModel implements PredictionModel {
+        @Override
+        public Vec3d predict(Deque<HistoryEntry> history, LivingEntity target) {
+            if (history.size() < 2) return target != null ? target.getPos() : Vec3d.ZERO;
+            HistoryEntry last = history.getLast();
+            Vec3d vel = target != null ? target.getVelocity() : Vec3d.ZERO;
+            if (vel.lengthSquared() < 0.01) return last.pos;
+            double smooth = 0.7;
+            return last.pos.add(vel.multiply(0.05).multiply(smooth));
+        }
+    }
+
+    private static class ClusterBasedModel implements PredictionModel {
+        @Override
+        public Vec3d predict(Deque<HistoryEntry> history, LivingEntity target) {
+            if (history.size() < 3) return target != null ? target.getPos() : Vec3d.ZERO;
+            List<HistoryEntry> list = new ArrayList<>(history);
+            int n = list.size();
+            Vec3d avgVel = Vec3d.ZERO;
+            for (int i = n-3; i < n-1; i++) {
+                HistoryEntry a = list.get(i);
+                HistoryEntry b = list.get(i+1);
+                double dt = b.dt;
+                if (dt > 0) avgVel = avgVel.add(b.pos.subtract(a.pos).multiply(1.0/dt));
+            }
+            avgVel = avgVel.multiply(1.0/3);
+            return list.get(n-1).pos.add(avgVel.multiply(0.05));
+        }
+    }
+
+    private static class RecurrentModel implements PredictionModel {
+        private final double[] weights = {0.5, 0.3, 0.2};
+        @Override
+        public Vec3d predict(Deque<HistoryEntry> history, LivingEntity target) {
+            if (history.size() < 3) return target != null ? target.getPos() : Vec3d.ZERO;
+            List<HistoryEntry> list = new ArrayList<>(history);
+            int n = list.size();
+            Vec3d predOffset = Vec3d.ZERO;
+            double totalW = 0;
+            for (int i = 0; i < Math.min(weights.length, n-1); i++) {
+                HistoryEntry a = list.get(n-2-i);
+                HistoryEntry b = list.get(n-1-i);
+                double dt = b.dt;
+                if (dt > 0) {
+                    Vec3d offset = b.pos.subtract(a.pos);
+                    predOffset = predOffset.add(offset.multiply(weights[i]));
+                    totalW += weights[i];
+                }
+            }
+            if (totalW > 0) predOffset = predOffset.multiply(1.0/totalW);
+            return list.get(n-1).pos.add(predOffset);
+        }
+    }
+
+    private static class PlayerProfile {
+        private final String name;
+        private double avgSpeed = 0;
+        private double speedVariance = 0;
+        private double turnFrequency = 0;
+        private int samples = 0;
+        private final Deque<Double> turnAngles = new ArrayDeque<>();
+
+        public PlayerProfile(String name) {
+            this.name = name;
+        }
+
+        public void update(LivingEntity target, Deque<HistoryEntry> history) {
+            Vec3d vel = target.getVelocity();
+            double speed = vel.length();
+            if (samples == 0) {
+                avgSpeed = speed;
+            } else {
+                double oldAvg = avgSpeed;
+                avgSpeed = oldAvg + (speed - oldAvg) / (samples + 1);
+                speedVariance = (speedVariance * samples + (speed - oldAvg)*(speed - avgSpeed)) / (samples + 1);
+            }
+            samples++;
+
+            if (history.size() >= 2) {
+                List<HistoryEntry> list = new ArrayList<>(history);
+                HistoryEntry last = list.get(list.size()-1);
+                HistoryEntry prev = list.get(list.size()-2);
+                if (list.size() >= 3) {
+                    Vec3d dirPrev = prev.pos.subtract(list.get(list.size()-3).pos).normalize();
+                    Vec3d dirLast = last.pos.subtract(prev.pos).normalize();
+                    double angle = Math.acos(MathHelper.clamp(dirPrev.dotProduct(dirLast), -1, 1));
+                    turnAngles.add(angle);
+                    while (turnAngles.size() > 10) turnAngles.removeFirst();
+                    turnFrequency = turnAngles.stream().mapToDouble(a -> a).average().orElse(0);
+                }
+            }
+        }
+
+        public Vec3d correctPrediction(Vec3d pred) {
+            if (turnFrequency > 0.5) {
+                Random r = new Random();
+                pred = pred.add(new Vec3d((r.nextDouble()-0.5)*0.5, (r.nextDouble()-0.5)*0.5, (r.nextDouble()-0.5)*0.5));
+            }
+            return pred;
+        }
+
+        public void save() {
+            try {
+                Path dir = Paths.get(System.getProperty("user.dir"), "run", "profiles");
+                Files.createDirectories(dir);
+                Path file = dir.resolve(name + ".json");
+                Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                try (Writer writer = new FileWriter(file.toFile())) {
+                    gson.toJson(this, writer);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // -------------------- Нейро-запись и воспроизведение --------------------
+    public static class RotationFrame {
+        public final long timestamp;
+        public final float yaw;
+        public final float pitch;
+        public final boolean attack;
+
+        public RotationFrame(long timestamp, float yaw, float pitch, boolean attack) {
+            this.timestamp = timestamp;
+            this.yaw = yaw;
+            this.pitch = pitch;
+            this.attack = attack;
+        }
+    }
+
+    public class NeuroRecorder {
+        private final List<RotationFrame> frames = new ArrayList<>();
+        private long startTime = 0;
+        private boolean recording = false;
+        private String currentRecordingName = null;
+
+        private boolean playing = false;
+        private List<RotationFrame> playbackFrames = null;
+        private long playbackStart = 0;
+        private int playbackIndex = 0;
+
+        private final Path neuroDir = Paths.get(System.getProperty("user.dir"), "run", "neuro");
+        private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+        public NeuroRecorder() {
+            try {
+                Files.createDirectories(neuroDir);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        public synchronized void startRecording(String name) {
+            if (recording) stopRecording();
+            frames.clear();
+            recording = true;
+            currentRecordingName = name;
+            startTime = System.currentTimeMillis();
+        }
+
+        public synchronized void stopRecording() {
+            if (!recording) return;
+            if (currentRecordingName != null) {
+                saveToFile(currentRecordingName);
+            }
+            recording = false;
+            currentRecordingName = null;
+        }
+
+        public synchronized void recordFrame(float yaw, float pitch, boolean attack) {
+            if (!recording) return;
+            long now = System.currentTimeMillis() - startTime;
+            frames.add(new RotationFrame(now, yaw, pitch, attack));
+        }
+
+        public synchronized void startPlayback(String name) {
+            if (playing) stopPlayback();
+            playbackFrames = loadFromFile(name);
+            if (playbackFrames == null || playbackFrames.isEmpty()) return;
+            playing = true;
+            playbackStart = System.currentTimeMillis();
+            playbackIndex = 0;
+        }
+
+        public synchronized void stopPlayback() {
+            playing = false;
+            playbackFrames = null;
+            playbackIndex = 0;
+        }
+
+        public synchronized RotationFrame getCurrentPlaybackFrame() {
+            if (!playing || playbackFrames == null) return null;
+            long elapsed = System.currentTimeMillis() - playbackStart;
+            while (playbackIndex < playbackFrames.size() && playbackFrames.get(playbackIndex).timestamp <= elapsed) {
+                playbackIndex++;
+            }
+            if (playbackIndex >= playbackFrames.size()) {
+                stopPlayback();
+                return null;
+            }
+            return playbackFrames.get(playbackIndex);
+        }
+
+        public synchronized boolean isRecording() { return recording; }
+        public synchronized boolean isPlaying() { return playing; }
+        public synchronized String getLastRecordingName() { return currentRecordingName; }
+
+        private void saveToFile(String name) {
+            if (name == null) return;
+            try {
+                Path file = neuroDir.resolve(name + ".json");
+                Files.createDirectories(neuroDir);
+                try (Writer writer = new FileWriter(file.toFile())) {
+                    gson.toJson(frames, writer);
+                }
+                // Убрал вывод в чат, чтобы избежать спама. Сообщение выводится при остановке.
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        private List<RotationFrame> loadFromFile(String name) {
+            Path file = neuroDir.resolve(name + ".json");
+            if (!Files.exists(file)) return null;
+            try (Reader reader = new FileReader(file.toFile())) {
+                java.lang.reflect.Type listType = new TypeToken<List<RotationFrame>>(){}.getType();
+                return gson.fromJson(reader, listType);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return null;
+            }
+        }
+
+        public List<String> listRecordings() {
+            List<String> list = new ArrayList<>();
+            try {
+                Files.list(neuroDir).filter(p -> p.toString().endsWith(".json")).forEach(p -> {
+                    String name = p.getFileName().toString().replace(".json", "");
+                    list.add(name);
+                });
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            return list;
+        }
+
+        public void deleteRecording(String name) {
+            Path file = neuroDir.resolve(name + ".json");
+            try {
+                Files.deleteIfExists(file);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
